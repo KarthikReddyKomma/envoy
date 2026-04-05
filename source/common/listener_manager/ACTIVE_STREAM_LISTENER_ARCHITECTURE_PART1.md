@@ -1,4 +1,6 @@
-# Envoy Active Stream Listener Architecture
+# Envoy Active Stream Listener Architecture - Part 1: Core Architecture and Lifecycle
+
+> **Note**: This document is Part 1 of 2. See [Part 2: Operations and Management](ACTIVE_STREAM_LISTENER_ARCHITECTURE_PART2.md) for socket management, statistics, memory management, and advanced topics.
 
 ## Overview
 
@@ -56,6 +58,30 @@ graph TB
     style TcpSocket fill:#ffe1e1
     style TcpConn fill:#ccffcc
 ```
+
+---
+
+## Table of Contents
+
+**Part 1 (this document): Core Architecture and Lifecycle**
+1. [Class Hierarchy](#1-class-hierarchy)
+2. [Connection Lifecycle](#2-connection-lifecycle)
+3. [ActiveTcpSocket State Machine](#3-activetcpsocket-state-machine)
+4. [Listener Filter Processing](#4-listener-filter-processing)
+5. [Connection Management by Filter Chain](#5-connection-management-by-filter-chain)
+6. [Filter Chain Draining](#6-filter-chain-draining)
+7. [Connection Lifecycle Events](#7-connection-lifecycle-events)
+8. [Timeout Handling](#8-timeout-handling)
+
+**Part 2: Operations and Management** (see [ACTIVE_STREAM_LISTENER_ARCHITECTURE_PART2.md](ACTIVE_STREAM_LISTENER_ARCHITECTURE_PART2.md))
+9. Socket Management
+10. Statistics and Logging
+11. Memory Management
+12. Integration Points
+13. Error Handling
+14. Configuration
+15. Performance Considerations
+16. Key Design Patterns
 
 ---
 
@@ -138,44 +164,155 @@ classDiagram
     note for ActiveTcpConnection "Established active connection"
 ```
 
+**Class Hierarchy Code Responsibilities:**
+
+**`ActiveListenerImplBase`** (Base for all active listeners):
+- **Purpose**: Stores listener statistics and configuration shared across TCP/UDP/QUIC/Internal listeners
+- **Key Members**:
+  - `stats_: ListenerStats` - Per-listener counters (`downstream_cx_total`, `downstream_cx_active`, `no_filter_chain_match`)
+  - `per_worker_stats_: PerHandlerListenerStats` - Per-worker thread connection counts for balancing
+  - `config_: ListenerConfig*` - Reference to listener config (filter chains, socket options, bind address)
+- **Key Method**:
+  - `listenerTag()` - Returns unique identifier for this listener (used in maps and logs)
+- **Code Location**: `active_stream_listener_base.h:25-50`
+
+**`ActiveStreamListenerBase`** (TCP/Unix socket base):
+- **Purpose**: Manages socket lifecycle during listener filter processing phase (before filter chain matching)
+- **Key Members**:
+  - `sockets_: list<ActiveTcpSocket>` - Sockets currently in filter chain execution, waiting for completion or timeout
+  - `listener_: ListenerPtr` - OS socket (performs `accept()`), registered with epoll/kqueue
+  - `listener_filters_timeout_: milliseconds` - Max time for filters to complete (default 15s)
+  - `continue_on_listener_filters_timeout_: bool` - Proceed vs reject on timeout
+  - `is_deleting_: bool` - Set during destruction to prevent new connections
+- **Key Methods**:
+  - `newConnection(socket, stream_info)` - Called after filters pass → finds filter chain → creates active connection
+  - `removeSocket(socket)` - Removes from `sockets_` list → returns `unique_ptr` for deletion
+  - `onSocketAccepted(socket)` - Initial handler when OS accepts connection → creates `ActiveTcpSocket`
+  - `onFilterChainDraining(chains)` - Gracefully closes connections using specified filter chains
+- **Protected Abstract Method**:
+  - `newActiveConnection(filter_chain, conn, info)` - Template method for derived classes to implement storage strategy
+- **Code Location**: `active_stream_listener_base.h:55-185`
+
+**`OwnedActiveStreamListenerBase`** (Connection ownership layer):
+- **Purpose**: Groups active connections by filter chain for efficient draining during config updates (in-place filter chain modification)
+- **Key Members**:
+  - `connections_by_context_: map<FilterChain*, ActiveConnections>` - One container per unique filter chain
+- **Key Methods**:
+  - `removeConnection(connection)` - Removes from appropriate `ActiveConnections` container → deferred deletion
+  - `getOrCreateActiveConnections(filter_chain)` - Lazy container creation via `map[key]` → returns reference
+  - `removeFilterChain(filter_chain)` - Drains all connections using this chain → closes gracefully → removes map entry
+- **Why Needed**: Allows filter chain updates without listener socket close/reopen (hot reload optimization)
+- **Code Location**: `active_stream_listener_base.h:190-235`
+
+**`ActiveTcpSocket`** (Transient state during filter processing):
+- **Purpose**: Wraps connection socket while listener filters examine it (TLS Inspector, Proxy Protocol, Original Dst, etc.)
+- **Lifecycle**: Created on `accept()` → destroyed after promotion to `ActiveTcpConnection` or rejection
+- **Key Members**:
+  - `socket_: ConnectionSocketPtr` - Network socket with local/remote addresses
+  - `accept_filters_: list<FilterWrapper>` - Listener filters to execute sequentially
+  - `iter_: iterator` - Current position in filter list
+  - `timer_: TimerPtr` - Timeout for entire filter chain processing
+  - `stream_info_: StreamInfo` - Accumulates metadata from filters (SNI, ALPN, dynamic metadata)
+  - `connected_: bool` - Flag prevents duplicate `newConnection()` calls
+- **Key Methods**:
+  - `startFilterChain()` - Begins iteration → calls first filter's `onAccept()`
+  - `continueFilterChain(success)` - Resume after async filter or timeout → advance iterator
+  - `onTimeout()` - Handle filter timeout based on `continue_on_listener_filters_timeout` config
+  - `newConnection()` - Promote to `ActiveTcpConnection` after filters pass
+- **Code Location**: `active_tcp_socket.h:30-125`
+
+**`ActiveConnections`** (Container for connections on same filter chain):
+- **Purpose**: Holds all `ActiveTcpConnection` objects using identical filter chain configuration
+- **Why Useful**: When filter chain is removed (config update), all its connections can be found and drained together efficiently
+- **Key Members**:
+  - `listener_: OwnedActiveStreamListenerBase&` - Back-reference to owner for cleanup
+  - `filter_chain_: FilterChain&` - The filter chain these connections share
+  - `connections_: list<ActiveTcpConnection>` - Active connections list
+- **Lifetime**: Created lazily on first connection → destroyed when last connection closes (if not draining)
+- **Code Location**: `active_stream_listener_base.h:240-265`
+
+**`ActiveTcpConnection`** (Established connection):
+- **Purpose**: Represents active TCP connection after successful listener filter processing and filter chain matching
+- **Lifecycle**: Created after filter chain match → destroyed on connection close event
+- **Key Members**:
+  - `stream_info_: StreamInfo` - Connection metadata (start time, bytes, protocol)
+  - `active_connections_: ActiveConnections&` - Container this connection belongs to
+  - `connection_: ConnectionPtr` - `Network::Connection` for data I/O through network filters
+  - `conn_length_: TimespanPtr` - Tracks connection duration for stats
+- **Key Method**:
+  - `onEvent(event)` - Handles `LocalClose`/`RemoteClose` → calls `removeConnection()` → emits access logs
+- **Code Location**: `active_stream_listener_base.cc:310-380`
+
+**Design Patterns Applied:**
+
+1. **Template Method Pattern**:
+   - Base class (`ActiveStreamListenerBase`) defines algorithm skeleton: `newConnection()` → find filter chain → `newActiveConnection()`
+   - Derived class (`OwnedActiveStreamListenerBase`) implements specific steps: how to create and store connection
+   - Benefit: Base handles common logic (filtering, matching), derived handles storage strategy
+
+2. **Object Lifecycle Management**:
+   - Transient objects (`ActiveTcpSocket`) exist only during processing phase
+   - Long-lived objects (`ActiveTcpConnection`) persist until connection closes
+   - Deferred deletion via `dispatcher_.deferredDelete()` ensures safe cleanup after event loop iteration
+
 ---
 
 ## 2. Connection Lifecycle
 
 ### Complete Flow
 
+**Code Path Through Connection Lifecycle:**
+
+**Socket Acceptance Phase** (`active_tcp_listener.cc:347-366`):
+- OS places completed TCP connection in accept queue → `TcpListenerImpl::onSocketEvent()` triggered by epoll/kqueue
+- Calls `accept()` syscall → returns fd + peer address
+- Creates `ConnectionSocketImpl` wrapping fd with local/remote `Address::Instance`
+- Admission control: `rejectCxOverGlobalLimit()` checks `num_connections_` counter against limit
+- If pass: `cb_.onAccept(socket)` → delegates to `ActiveTcpListener::onAccept()`
+- If reject: `socket->close()`, increment `downstream_global_cx_overflow_` stat
+
+**Filter Chain Processing Phase** (`active_tcp_socket.cc:85-165`):
+- `ActiveTcpSocket` constructor stores socket, initializes `StreamInfo` with connection metadata
+- `createListenerFilterChain()` builds filter list from `listener_filter_factories_`
+- `continueFilterChain(true)` starts iteration at `iter_ = accept_filters_.begin()`
+- Each filter's `onAccept()` returns:
+  - **Continue**: `++iter_`, immediately invoke next filter
+  - **StopIteration**: `startTimer(listener_filters_timeout_)`, add to `sockets_` list, wait for I/O
+  - **Close**: Rejection, proceed to socket closure
+- On timeout: `onTimeout()` checks `continue_on_listener_filters_timeout_` config
+  - If true: resume with `continueFilterChain(true)` (may match less-specific chain)
+  - If false: reject with `continueFilterChain(false)`
+
+**Filter Chain Matching** (`filter_chain_manager_impl.cc:380-520`):
+- `newConnection()` calls `findFilterChain(socket, stream_info)`
+- Matching algorithm walks LC-trie in precedence order:
+  - Destination port → `destination_ports_map_[port]`
+  - Destination IP → LC-trie lookup in `destination_ips_trie_`
+  - Server name (SNI) → exact or wildcard match in `server_names_map_`
+  - Transport protocol → "tls", "raw_buffer"
+  - ALPN → "h2", "http/1.1"
+  - Source IP/port → range checks
+- Returns `FilterChain*` or `default_filter_chain_` or `nullptr`
+
+**Connection Establishment** (`active_stream_listener_base.cc:195-220`):
+- If match found: `newActiveConnection(filter_chain, conn, stream_info)`
+- `getOrCreateActiveConnections(filter_chain)` lazily creates `ActiveConnections` container
+- `ActiveTcpConnection` constructed, added to `connections_by_context_[filter_chain]`
+- Network filter chain built via `filter_chain->networkFilterFactories()->createNetworkFilterChain()`
+- Connection registered: `active_connections_.insert(conn)`
+- Stats updated: `downstream_cx_total_.inc()`, `downstream_cx_active_.inc()`
+
+**Active Connection Phase**:
+- Connection processes data through network filter pipeline (HTTP codec, TCP proxy, etc.)
+- Each filter `onData()` called as bytes arrive
+
+**Connection Termination Phase** (`active_tcp_connection.cc:55-75`):
+- `onEvent(LocalClose | RemoteClose)` → triggers `removeConnection(this)`
+- Parent removes from `connections_` list
+- `emitLogs()` writes access log entry with `StreamInfo` data
+- `dispatcher_.deferredDelete()` schedules destruction after event loop iteration completes
+
 **This sequence diagram shows the complete journey of a TCP connection from acceptance to active processing:**
-
-**Socket Acceptance Phase:**
-- Operating system signals a new TCP connection is available
-- Network listener accepts the socket from the OS
-- `ActiveStreamListenerBase` creates an `ActiveTcpSocket` wrapper to manage the socket
-- The socket enters the listener filter processing phase
-
-**Filter Chain Processing Phase:**
-- Listener filters (like TLS Inspector, Proxy Protocol parser) are created and chained together
-- Each filter examines the connection to extract metadata (SNI, ALPN, source IP, etc.)
-- Filters can return three statuses:
-  - **Continue**: Move to next filter immediately
-  - **StopIteration**: Need more data - socket is added to waiting list with timeout
-  - **Close**: Reject this connection
-- If filters time out, behavior depends on `continue_on_listener_filters_timeout` setting
-
-**Connection Establishment Phase:**
-- Once filters complete successfully, `newConnection()` is called
-- The appropriate filter chain is matched based on collected metadata
-- An `ActiveTcpConnection` is created and added to the connection tracking map
-- Network filters are initialized and the connection begins processing data
-
-**Active Connection Phase:**
-- Connection processes requests through its network filter chain
-- Statistics are updated for active connections
-
-**Connection Termination Phase:**
-- Connection close event triggers `removeConnection()`
-- Connection is removed from tracking structures
-- Access logs are emitted with final connection statistics
-- Resources are scheduled for deferred deletion
 
 ```mermaid
 sequenceDiagram
@@ -317,6 +454,32 @@ stateDiagram-v2
         ActiveTcpConnection created
     end note
 ```
+
+**State Transition Code Paths:**
+
+| From State | Event/Trigger | Condition | Action Taken | Code Location | Next State |
+|------------|---------------|-----------|--------------|---------------|------------|
+| Created | `startFilterChain()` called | Always | `iter_ = accept_filters_.begin()` | `active_tcp_socket.cc:85` | FilterProcessing |
+| FilterProcessing | `continueFilterChain()` | `iter_ != end()` | Call `(*iter_)->onAccept(socket_)` | `active_tcp_socket.cc:95` | FilterIterating |
+| FilterIterating | Filter returns `Continue` | Not at end | `++iter_`, loop continues | `active_tcp_socket.cc:120` | FilterIterating |
+| FilterIterating | Filter returns `StopIteration` | `!isEndFilterIteration()` | `startTimer()`, `moveIntoListBack(sockets_)` | `active_tcp_socket.cc:135` | NeedMoreData |
+| FilterIterating | Filter returns `Close` | Always | Set failure reason in `stream_info_` | `active_tcp_socket.cc:145` | FilterFailed |
+| FilterIterating | `iter_ == end()` | All filters passed | Prepare for connection | `active_tcp_socket.cc:150` | FilterPassed |
+| NeedMoreData | Socket added | Always | Wait for I/O event or timeout | `active_tcp_socket.cc:140` | Waiting |
+| Waiting | Data arrives on socket | Before timeout | `continueFilterChain(true)` resumes | `active_tcp_socket.cc:175` | FilterIterating |
+| Waiting | `timer_->enableTimer()` fires | `continue_on_timeout=true` | `continueFilterChain(true)` | `active_tcp_socket.cc:160` | FilterIterating |
+| Waiting | `timer_->enableTimer()` fires | `continue_on_timeout=false` | `continueFilterChain(false)` | `active_tcp_socket.cc:165` | FilterFailed |
+| FilterPassed | All filters complete | `connected_ == false` | `newConnection()` called | `active_tcp_socket.cc:195` | Connected |
+| FilterFailed | Rejection | Always | `socket_->close()`, `emitLogs()` | `active_tcp_socket.cc:210` | Closed |
+| Connected | Promotion complete | Always | Remove from `sockets_` list | `active_stream_listener_base.cc:200` | [End] |
+| Closed | Socket destroyed | Always | `dispatcher_.deferredDelete(this)` | `active_tcp_socket.cc:75` | [End] |
+
+**Critical Fields State Changes:**
+- `iter_`: Advances through `accept_filters_` list, tracks current filter position
+- `connected_`: Boolean flag set after `newConnection()`, prevents duplicate promotion
+- `timer_`: Armed when filter returns `StopIteration`, disarmed on data arrival or timeout
+- `stream_info_`: Accumulates metadata from each filter (dynamic metadata, SNI, ALPN)
+- `listener_filter_buffer_`: Optional buffer for filters needing to peek at initial bytes
 
 ---
 
@@ -735,468 +898,6 @@ continue_on_listener_filters_timeout_: bool
 
 ---
 
-## 9. Socket Management
+## Continue to Part 2
 
-### Sockets List Operations
-
-```mermaid
-graph TB
-    subgraph "ActiveStreamListenerBase"
-        SocketsList[sockets_<br/>list~unique_ptr~ActiveTcpSocket~~]
-    end
-
-    subgal "Operations"
-        Add[Add Socket]
-        Remove[Remove Socket]
-        Iterate[Iterate Sockets]
-        Clear[Clear on Destroy]
-    end
-
-    Add -->|LinkedList::moveIntoListBack| SocketsList
-    SocketsList -->|removeSocket| Remove
-    SocketsList --> Iterate
-    SocketsList --> Clear
-
-    style Add fill:#ccffcc
-    style Remove fill:#ffcccc
-    style SocketsList fill:#e1f5ff
-```
-
-### Socket Addition and Removal
-
-```mermaid
-sequenceDiagram
-    participant Filter as Listener Filter
-    participant Socket as ActiveTcpSocket
-    participant List as sockets_ list
-    participant Listener as ActiveStreamListenerBase
-
-    Note over Filter,List: Filter Returns StopIteration
-
-    Filter->>Socket: Return StopIteration
-    Socket->>Socket: Check isEndFilterIteration()
-    Socket-->>Socket: false (not at end)
-
-    Socket->>Socket: startTimer()
-    Socket->>List: LinkedList::moveIntoListBack
-    Note over List: Socket now owned by list
-
-    Note over Socket,List: Later: Filter Chain Completes
-
-    Socket->>Socket: continueFilterChain completes
-    Socket->>Listener: newConnection()
-    Listener->>List: removeSocket(socket)
-    List->>List: Remove from list
-    List-->>Listener: unique_ptr~ActiveTcpSocket~
-
-    Note over Listener: Socket ownership transferred
-    Listener->>Listener: Create ActiveTcpConnection
-```
-
----
-
-## 10. Statistics and Logging
-
-### Listener Statistics
-
-```mermaid
-graph TB
-    subgraph "ListenerStats (Per-Listener)"
-        CxTotal[downstream_cx_total]
-        CxActive[downstream_cx_active]
-        CxDestroy[downstream_cx_destroy]
-        CxLength[downstream_cx_length_ms]
-        NoFilter[no_filter_chain_match]
-    end
-
-    subgraph "PerHandlerListenerStats (Per-Worker)"
-        WorkerCxActive[downstream_cx_active]
-        WorkerCxTotal[downstream_cx_total]
-    end
-
-    subgraph "Events"
-        NewConn[New Connection] --> CxTotal
-        NewConn --> CxActive
-        NewConn --> WorkerCxTotal
-        NewConn --> WorkerCxActive
-
-        ConnClose[Connection Close] --> CxDestroy
-        ConnClose --> CxLength
-        ConnClose -.->|dec| CxActive
-        ConnClose -.->|dec| WorkerCxActive
-
-        NoMatch[No Filter Chain] --> NoFilter
-    end
-
-    style CxTotal fill:#ccffcc
-    style CxActive fill:#ffffcc
-    style CxDestroy fill:#ffcccc
-```
-
-### Log Emission
-
-```mermaid
-sequenceDiagram
-    participant Event
-    participant Listener as ActiveStreamListenerBase
-    participant StreamInfo
-    participant Logger as Access Logger
-
-    Note over Event: Connection Event Occurs
-
-    alt Socket rejected before connection
-        Event->>Listener: emitLogs(config, stream_info)
-        Note over Listener: Socket failed filters
-    else Connection closed normally
-        Event->>Listener: emitLogs(config, stream_info)
-        Note over Listener: Connection terminated
-    end
-
-    Listener->>StreamInfo: Populate final fields
-    StreamInfo->>StreamInfo: Set response code
-    StreamInfo->>StreamInfo: Set response flags
-    StreamInfo->>StreamInfo: Set bytes sent/received
-
-    Listener->>Logger: Log access log entry
-    Logger->>Logger: Format and write
-
-    Note over Logger: Includes:<br/>- Connection duration<br/>- Bytes transferred<br/>- Filter state<br/>- Dynamic metadata
-```
-
----
-
-## 11. Memory Management
-
-### Ownership Model
-
-```mermaid
-graph TB
-    subgraph "ActiveStreamListenerBase"
-        SocketsList[sockets_<br/>Owned by list]
-    end
-
-    subgraph "OwnedActiveStreamListenerBase"
-        ConnsByContext[connections_by_context_<br/>Owned by map]
-    end
-
-    subgraph "ActiveConnections"
-        ConnsList[connections_<br/>Owned by list]
-    end
-
-    ActiveSocket1[ActiveTcpSocket 1]
-    ActiveSocket2[ActiveTcpSocket 2]
-
-    ActiveConn1[ActiveTcpConnection 1]
-    ActiveConn2[ActiveTcpConnection 2]
-    ActiveConn3[ActiveTcpConnection 3]
-
-    SocketsList -->|unique_ptr| ActiveSocket1
-    SocketsList -->|unique_ptr| ActiveSocket2
-
-    ConnsByContext -->|unique_ptr| ConnsList
-
-    ConnsList -->|unique_ptr| ActiveConn1
-    ConnsList -->|unique_ptr| ActiveConn2
-    ConnsList -->|unique_ptr| ActiveConn3
-
-    style SocketsList fill:#e1f5ff
-    style ConnsByContext fill:#ffe1e1
-    style ConnsList fill:#ccffcc
-```
-
-### Deferred Deletion
-
-```mermaid
-sequenceDiagram
-    participant Object
-    participant Dispatcher
-    participant DeferredList as Deferred Delete List
-
-    Note over Object: Object ready for deletion
-
-    Object->>Dispatcher: Add to deferred delete list
-    Dispatcher->>DeferredList: Push back
-
-    Note over DeferredList: Object still alive<br/>References safe this iteration
-
-    Note over Dispatcher: Current event loop iteration ends
-
-    Dispatcher->>DeferredList: clearDeferredDeleteList()
-
-    loop For each object
-        DeferredList->>Object: unique_ptr destructor
-        Note over Object: Object destroyed
-    end
-
-    Note over DeferredList: List cleared
-```
-
-**Objects using deferred deletion:**
-- `ActiveTcpSocket`
-- `ActiveTcpConnection`
-- `ActiveConnections`
-
----
-
-## 12. Integration Points
-
-### Connection Handler Integration
-
-```mermaid
-graph TB
-    subgraph "ConnectionHandler"
-        Handler[ConnectionHandler]
-        ActiveListener[ActiveListener Interface]
-    end
-
-    subgraph "Listener Implementation"
-        StreamListener[ActiveStreamListenerBase]
-        OwnedListener[OwnedActiveStreamListenerBase]
-    end
-
-    subgraph "Concrete Implementations"
-        TcpListener[ActiveTcpListener]
-        UdpListener[ActiveRawUdpListener]
-    end
-
-    Handler --> ActiveListener
-    ActiveListener <|.. StreamListener
-    StreamListener <|-- OwnedListener
-    OwnedListener <|-- TcpListener
-    OwnedListener <|-- UdpListener
-
-    style Handler fill:#e1f5ff
-    style StreamListener fill:#ffe1e1
-    style TcpListener fill:#ccffcc
-```
-
-### Network Filter Chain Integration
-
-```mermaid
-sequenceDiagram
-    participant Socket as ActiveTcpSocket
-    participant Listener as ActiveStreamListenerBase
-    participant FilterChain as Network::FilterChain
-    participant ServerConn as ServerConnection
-    participant NetworkFilters as Network Filters
-
-    Socket->>Listener: newConnection()
-    Listener->>Listener: Find appropriate FilterChain
-    Listener->>ServerConn: Create ServerConnection
-    Listener->>Listener: newActiveConnection(filter_chain, conn, info)
-
-    Note over Listener: Abstract method implemented by derived class
-
-    Listener->>FilterChain: buildFilterChain(connection)
-    FilterChain->>NetworkFilters: Create filter instances
-    NetworkFilters->>ServerConn: Add to read/write filters
-
-    ServerConn->>ServerConn: Start processing
-    Note over ServerConn: Connection now active
-```
-
----
-
-## 13. Error Handling
-
-### Error Scenarios
-
-```mermaid
-flowchart TD
-    Start[Error Occurs] --> CheckType{Error Type}
-
-    CheckType -->|Filter Chain Creation Failed| NoECDS[ECDS config missing]
-    CheckType -->|Filter Timeout| Timeout[Listener filter timeout]
-    CheckType -->|Filter Rejection| Reject[Filter returns Close]
-    CheckType -->|Connection Error| ConnErr[Connection event error]
-
-    NoECDS --> CloseSocket[Close socket immediately]
-    Timeout --> CheckConfig{continue_on_timeout?}
-    Reject --> CloseSocket
-    ConnErr --> CloseConn[Close connection]
-
-    CheckConfig -->|false| CloseSocket
-    CheckConfig -->|true| ContinueChain[Continue filter chain]
-
-    CloseSocket --> EmitLog1[emitLogs]
-    CloseConn --> EmitLog2[emitLogs]
-    ContinueChain --> Process[Continue processing]
-
-    EmitLog1 --> UpdateStats1[Update error stats]
-    EmitLog2 --> UpdateStats2[Update error stats]
-
-    UpdateStats1 --> Cleanup[Deferred deletion]
-    UpdateStats2 --> Cleanup
-    Process --> End[Continue]
-
-    style CloseSocket fill:#ffcccc
-    style CloseConn fill:#ff8888
-    style Reject fill:#ff4444
-```
-
-### Error Statistics
-
-| Error Type | Stat Name | Trigger |
-|-----------|-----------|---------|
-| No filter chain match | `no_filter_chain_match` | Cannot find matching filter chain |
-| Connection create failed | `downstream_cx_destroy` | Connection failed during creation |
-| Filter timeout | Custom filter stat | Listener filter timeout exceeded |
-| Filter rejection | Custom filter stat | Filter explicitly rejects connection |
-
----
-
-## 14. Configuration
-
-### Key Configuration Parameters
-
-```yaml
-# Listener configuration
-listener:
-  # Listener filter timeout
-  listener_filters_timeout: 15s
-
-  # Continue processing after timeout
-  continue_on_listener_filters_timeout: false
-
-  # Listener filters
-  listener_filters:
-    - name: envoy.filters.listener.tls_inspector
-    - name: envoy.filters.listener.http_inspector
-    - name: envoy.filters.listener.original_dst
-
-  # Filter chains
-  filter_chains:
-    - filter_chain_match:
-        server_names: ["example.com"]
-      filters:
-        - name: envoy.filters.network.http_connection_manager
-```
-
-### Configuration Impact
-
-```mermaid
-graph TB
-    Config[Listener Config] --> Timeout[listener_filters_timeout]
-    Config --> Continue[continue_on_timeout]
-    Config --> ListenerFilters[listener_filters]
-    Config --> FilterChains[filter_chains]
-
-    Timeout --> SocketTimer[ActiveTcpSocket timer]
-    Continue --> TimeoutBehavior[Timeout handling]
-    ListenerFilters --> FilterChain[Filter chain creation]
-    FilterChains --> ConnGroups[Connection grouping]
-
-    style Config fill:#e1f5ff
-    style Timeout fill:#ffffcc
-    style Continue fill:#ffffcc
-```
-
----
-
-## 15. Performance Considerations
-
-### Optimization Strategies
-
-1. **Lazy Filter Chain Creation**
-   - Filter chains created only when needed
-   - Reduces memory overhead for idle listeners
-
-2. **Connection Grouping**
-   - Connections grouped by filter chain
-   - Efficient draining of specific filter chains
-   - O(1) lookup by filter chain pointer
-
-3. **Deferred Deletion**
-   - Objects deleted at safe points
-   - Prevents use-after-free
-   - Minimal overhead (end of event loop)
-
-4. **Linked Lists for Ordering**
-   - O(1) insertion/removal
-   - Maintains connection order
-   - Cache-friendly iteration
-
-### Performance Metrics
-
-```mermaid
-graph LR
-    subgraph "Timing"
-        Accept[Socket Accept: ~10μs]
-        Filter[Filter Processing: ~100μs]
-        Connect[Connection Create: ~50μs]
-    end
-
-    subgraph "Memory"
-        SocketMem[ActiveTcpSocket: ~512 bytes]
-        ConnMem[ActiveTcpConnection: ~1KB]
-    end
-
-    subgraph "Scalability"
-        Conns[Connections: 100K+]
-        Listeners[Listeners: 1000+]
-    end
-
-    style Accept fill:#ccffcc
-    style Filter fill:#ffffcc
-    style Connect fill:#ccffcc
-```
-
----
-
-## 16. Key Design Patterns
-
-### Pattern 1: Template Method Pattern
-- `ActiveStreamListenerBase` provides template
-- Derived classes implement `newActiveConnection()`
-- Separation of socket handling from connection management
-
-### Pattern 2: Chain of Responsibility
-- Listener filters form a chain
-- Each filter can:
-  - Pass to next filter
-  - Stop and wait
-  - Reject connection
-- Flexible, extensible filtering
-
-### Pattern 3: Composite Pattern
-- `ActiveConnections` groups connections
-- Organized by filter chain
-- Enables batch operations (drain)
-
-### Pattern 4: Deferred Deletion Pattern
-- Objects marked for deletion
-- Actual deletion deferred to safe point
-- Prevents dangling references
-
----
-
-## Summary
-
-The Active Stream Listener architecture provides:
-
-1. **Robust Socket Processing**
-   - Flexible listener filter chain
-   - Timeout handling
-   - Graceful failure modes
-
-2. **Efficient Connection Management**
-   - Grouped by filter chain
-   - O(1) operations for common paths
-   - Memory-efficient storage
-
-3. **Lifecycle Management**
-   - Clear ownership model
-   - Deferred deletion for safety
-   - Comprehensive logging
-
-4. **Extensibility**
-   - Abstract base for customization
-   - Template method pattern
-   - Filter chain extensibility
-
-5. **Production Ready**
-   - Error handling at all layers
-   - Detailed statistics
-   - Graceful degradation
-
-This design enables Envoy to efficiently handle millions of connections while maintaining safety, observability, and flexibility for diverse deployment scenarios.
+For socket management, statistics, memory management, integration points, error handling, configuration, performance, and design patterns, see [ACTIVE_STREAM_LISTENER_ARCHITECTURE_PART2.md](ACTIVE_STREAM_LISTENER_ARCHITECTURE_PART2.md).

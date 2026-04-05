@@ -606,6 +606,48 @@ void ActiveTcpListener::resumeListening() {
 
 ### From Bootstrap to Connection Accept
 
+**Code Path Summary:**
+
+**Main Thread Initialization** (`listener_manager_impl.cc:340-450`):
+- Bootstrap config loaded → `ListenerManagerImpl::addOrUpdateListener()` parses listener proto
+- `ListenerImpl::create()` builds filter chain factories from config
+- Listener enters `warming_listeners_` map → dependency resolution + init manager completion
+- After warming: moves to `active_listeners_` map
+- `addListenerToWorker()` posts task to each worker thread's dispatcher queue
+
+**Worker Thread Setup** (`connection_handler_impl.cc:180-250`):
+- Worker event loop picks up posted `addListener` task
+- `ConnectionHandlerImpl::addListener()` creates `ActiveTcpListener` instance
+- `ActiveTcpListener` constructor calls `parent.createListener(socket, *this)` → returns `TcpListenerImpl`
+- `TcpListenerImpl` registers listen socket fd with epoll/kqueue via `initializeFileEvent()`
+- Lambda callback captures `TcpListenerImpl` → will invoke `onSocketEvent()` when readable
+- `enable()` called → `enableFileEvents(Read)` activates monitoring
+
+**Connection Accept Flow** (`tcp_listener_impl.cc:200-270`):
+- Client TCP SYN → kernel completes handshake → connection in accept queue
+- Listen socket becomes readable → epoll/kqueue wakes event loop
+- Event loop invokes lambda → `TcpListenerImpl::onSocketEvent()`
+- Loop calls `accept()` syscall → retrieves connected socket fd
+- Admission control checks: global limit, overload state, random rejection
+- Pass → `cb_.onAccept(socket)` delegates to `ActiveTcpListener`
+
+**Listener Filter + Filter Chain Matching** (`active_tcp_socket.cc:85-195`, `filter_chain_manager_impl.cc:380`):
+- `ActiveTcpListener::onAccept()` checks per-listener limit
+- Connection balancing: `pickTargetHandler()` may post to different worker (SO_REUSEPORT + BPF)
+- `ActiveTcpSocket` created, listener filters run (TLS Inspector extracts SNI, ALPN)
+- After filters pass: `findFilterChain()` walks matching trie (port → IP → SNI → protocol → ALPN)
+- Returns `FilterChainImpl*` → contains network filter factories
+
+**Connection Establishment** (`connection_impl.cc:120-180`, `active_tcp_connection.cc:35-60`):
+- `newActiveConnection()` creates `TransportSocket` (TLS or raw buffer)
+- `ConnectionImpl` created with I/O handle + transport socket
+- Network filters instantiated via factories, added to filter chain
+- `ActiveTcpConnection` added to `connections_by_context_[filter_chain]` map
+- Stats incremented: `downstream_cx_total`, `downstream_cx_active`
+- Connection ready to process application data
+
+**Detailed Timeline (ASCII Diagram):**
+
 ```
 [Bootstrap Config File]
         ↓
