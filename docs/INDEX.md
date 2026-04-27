@@ -32,6 +32,13 @@ Find a topic below to see which document(s) cover it.
 | **Observability (access logs, admin, stats, tracing)** | [source/docs/observability/*.md](source/docs/observability/) |
 | **Dynamic modules (ABI, HTTP filter, SDKs)** | [source/extensions/dynamic_modules/*.md](source/extensions/dynamic_modules/) |
 | **Tools (code quality, API, build, debugging, etc.)** | [tools/docs/01](tools/docs/01-Overview.md) – [09](tools/docs/09-Adding-New-Tools.md) |
+| **Admin Interface & Operations** | [admin-operations/01](admin-operations/01-admin-interface.md) – [03](admin-operations/03-operational-procedures.md), [admin-operations/README](admin-operations/README.md) |
+| **Extension Development (filters, load balancers, etc.)** | [extension-development/01](extension-development/01-overview.md) – [05](extension-development/05-extension-registration.md), [extension-development/README](extension-development/README.md) |
+| **Testing (unit, integration, benchmarks)** | [testing/01](testing/01-testing-overview.md) – [05](testing/05-benchmarking.md), [testing/README](testing/README.md) |
+| **Memory & Performance (threading, buffers, optimization)** | [memory-performance/01](memory-performance/01-threading-model.md) – [04](memory-performance/04-performance-optimization.md), [memory-performance/README](memory-performance/README.md) |
+| **Debugging & Error Handling** | [debugging/01](debugging/01-error-handling-patterns.md) – [04](debugging/04-common-issues.md), [debugging/README](debugging/README.md) |
+| **Deployment & Operations (patterns, hot restart, K8s)** | [deployment/01](deployment/01-deployment-patterns.md) – [04](deployment/04-production-hardening.md), [deployment/README](deployment/README.md) |
+| **QUIC & UDP (HTTP/3, UDP proxy, address caching)** | [quic-udp/01](quic-udp/01-quic-overview.md) – [04](quic-udp/04-configuration-examples.md), [quic-udp/README](quic-udp/README.md) |
 
 ---
 
@@ -330,6 +337,91 @@ For each **document or document series**, a short summary of what it contains.
 
 ---
 
+### docs/admin-operations/ (Admin Interface & Operations)
+
+| Document | Content covered |
+|----------|------------------|
+| **01-admin-interface** | Complete admin endpoint reference (/stats, /config_dump, /clusters, /listeners, /runtime, /logging, /drain_listeners, /healthcheck, profiling endpoints, /quitquitquit, /certs, /help); configuration and security best practices. |
+| **02-runtime-configuration** | Runtime configuration system; layered architecture (admin, disk, RTDS, static); common runtime keys (circuit breakers, health checks, outlier detection, retry, feature flags); admin interface operations (/runtime, /runtime_modify); gradual feature rollout patterns. |
+| **03-operational-procedures** | Graceful shutdown and draining (immediate, graceful, inbound-only modes); hot restart mechanism; health check management; log management and rotation; statistics collection; configuration management; monitoring and alerting; troubleshooting operations. |
+| **README** | Overview, quick reference commands, security guidance. |
+
+---
+
+### docs/extension-development/ (Extension Development)
+
+| Document | Content covered |
+|----------|------------------|
+| **01-overview** | Extension system architecture; extension types (HTTP filters, network filters, listener filters, load balancers, transport sockets, access loggers, clusters, health checkers, tracers, stat sinks, resource monitors); factory pattern; extension lifecycle; configuration system; threading model. |
+| **02-http-filter-development** | HTTP filter interfaces (StreamDecoderFilter, StreamEncoderFilter, StreamFilter); complete lifecycle and callbacks; configuration and factory implementation; route-specific config; common patterns (pass-through, buffering, async, header manipulation, body transformation, per-route config); testing patterns (unit and integration). |
+| **03-network-filter-development** | Network filter interfaces (ReadFilter, WriteFilter, Filter); lifecycle; implementation examples; common patterns (protocol detection, rate limiting, protocol parsing, TCP proxy, async operations); testing examples. |
+| **04-listener-filter-development** | ListenerFilter and QuicListenerFilter interfaces; listener filter lifecycle; common patterns (TLS SNI inspection, original destination recovery, proxy protocol parsing, early rejection, dynamic routing); testing examples. |
+| **05-extension-registration** | Extension registry and registration macros; Bazel build system integration; BUILD file templates; protocol buffer setup; static vs dynamic registration; extension metadata; deployment strategies. |
+| **README** | Quick start, extension types overview, development workflow, common patterns, best practices. |
+
+---
+
+### docs/testing/ (Testing Infrastructure)
+
+| Document | Content covered |
+|----------|------------------|
+| **01-testing-overview** | Testing philosophy and principles; test types (unit, integration, benchmark, fuzz); Google Test and Google Mock frameworks; test infrastructure and utilities; time management in tests; custom matchers. |
+| **02-unit-testing** | GoogleTest framework basics; test fixtures and setup patterns; mock objects (NiceMock, StrictMock); common mock classes from test/mocks/; testing patterns (protobufs, exceptions, callbacks); real examples from test/common/. |
+| **03-integration-testing** | BaseIntegrationTest and HttpIntegrationTest hierarchy; basic integration test patterns; ConfigHelper; FakeUpstream usage; autonomous upstream; common patterns (waiting, stats, timeouts, retries); debugging techniques. |
+| **04-filter-testing** | HTTP filter testing patterns; network filter testing; listener filter testing; filter factory testing; integration tests for filters; examples for all filter types. |
+| **05-benchmarking** | Google Benchmark framework usage; writing benchmark tests; running benchmarks locally and in CI; benchmark patterns for buffers, headers, stats; best practices and common pitfalls; interpreting results. |
+| **README** | Quick start guide, documentation structure, test locations, running commands, key concepts, best practices. |
+
+---
+
+### docs/memory-performance/ (Memory & Performance)
+
+| Document | Content covered |
+|----------|------------------|
+| **01-threading-model** | Main thread vs worker threads architecture; Thread Local Storage (TLS) implementation; event loop (Dispatcher) design based on libevent; thread-safe design patterns; cross-thread communication via post(); configuration and tuning; debugging threading issues. |
+| **02-buffer-management** | Buffer::Instance interface; slice-based architecture (16 KB slices); zero-copy operations (move, fragments, reservations); watermarks for flow control; memory accounting per-stream; performance optimizations; common usage patterns. |
+| **03-memory-management** | TCMalloc integration and architecture; memory statistics and monitoring; heap profiling with pprof; AllocatorManager and heap shrinker; memory accounting classes; smart pointer usage patterns; leak detection tools (ASAN, Valgrind); configuration examples. |
+| **04-performance-optimization** | Lock-free design patterns (TLS, atomics, RCU); zero-copy techniques; cache-friendly code patterns; efficient allocation strategies; profiling tools (pprof, perf, benchmarks); optimization workflow; best practices and anti-patterns. |
+| **README** | Overview, quick start for developers and operators, common use cases, performance metrics, configuration examples, best practices, glossary. |
+
+---
+
+### docs/debugging/ (Debugging & Error Handling)
+
+| Document | Content covered |
+|----------|------------------|
+| **01-error-handling-patterns** | Status and StatusOr usage patterns; error propagation; complete Response Flags reference (30+ flags); connection close reasons; response code details; common error scenarios; best practices. |
+| **02-logging-and-tracing** | Logger system architecture; log levels (trace/debug/info/warn/error/critical); logging macros (ENVOY_LOG, ENVOY_CONN_LOG, ENVOY_STREAM_LOG, etc.); all 60+ logger IDs documented; fine-grain logging; connection and stream tracking; request tracing; rate-limited logging; runtime log configuration; debugging with logs. |
+| **03-debugging-tools** | Admin interface for debugging; GDB usage with Envoy; core dump analysis; ASAN (AddressSanitizer); TSAN (ThreadSanitizer); performance profiling with perf and gperftools; network debugging tools (tcpdump, wireshark, strace, lsof); configuration debugging; debugging cheat sheet. |
+| **04-common-issues** | Connection failures (DNS, wrong port, pool exhaustion, firewall); TLS/certificate issues (expired certs, validation, SNI, protocol, mTLS); configuration errors; performance problems; memory leaks; crash troubleshooting; timeout issues; health check failures; route matching problems; filter chain issues; troubleshooting checklist. |
+| **README** | Quick start with health checks, documentation structure, troubleshooting flowchart, quick reference tables, 4 debugging scenarios, tools installation, FAQ, best practices. |
+
+---
+
+### docs/deployment/ (Deployment & Operations)
+
+| Document | Content covered |
+|----------|------------------|
+| **01-deployment-patterns** | Edge proxy configuration with TLS, rate limiting, circuit breakers; service mesh sidecar with Istio; API gateway with JWT, external authz, rate limiting; internal load balancer with health checking; ingress controller with Kubernetes; pattern comparison and selection guidance; complete YAML configs for each pattern. |
+| **02-hot-restart** | Hot restart architecture with diagrams; implementation details from source/server/hot_restart_impl.h; shared memory structure and RPC protocol; class hierarchy and sequence diagrams; operational procedures; systemd integration with service unit files; epoch calculation scripts; troubleshooting guide; limitations and gotchas. |
+| **03-container-deployment** | Docker best practices with multi-stage builds; optimized Dockerfiles (including distroless); Docker Compose examples; complete Kubernetes manifests with HPA and PDB; sidecar pattern implementations; init containers (iptables, validation, cert fetching); Istio sidecar injection (automatic and manual); lifecycle management with preStop hooks; resource limits with calculation guidelines; health checks (liveness, readiness, startup probes). |
+| **04-production-hardening** | Security hardening (least privilege, non-root, TLS 1.3); secrets management (External Secrets, SDS); access control (IP whitelisting, JWT, RBAC); rate limiting (local and global); security headers; Kubernetes Network Policies; resource limits and performance tuning; overload manager; monitoring setup (Prometheus, metrics, tracing, access logs); alert rules; AlertManager config; disaster recovery; SRE runbooks for common incidents. |
+| **README** | Overview, links to all guides, quick start information. |
+
+---
+
+### docs/quic-udp/ (QUIC & UDP)
+
+| Document | Content covered |
+|----------|------------------|
+| **01-quic-overview** | QUIC protocol fundamentals and benefits; detailed architecture diagrams; server and client-side QUIC components; connection management and lifecycle; stream multiplexing; integration with HTTP Connection Manager; security and performance characteristics. |
+| **02-quic-implementation** | Deep dive into address caching optimization (from io_socket_handle_impl.h:106-107) with LRU cache implementation and performance analysis; QuicServerTransportSocketFactory; QuicFilterManagerConnectionImpl; EnvoyQuicServerSession and EnvoyQuicClientSession; buffer management and watermarks; connection migration implementation; stream management; packet writing and GSO support. |
+| **03-udp-listeners** | UDP listener architecture; UdpListenerImpl implementation; session management (sticky and per-packet); UDP session filters; UDP tunneling (CONNECT-UDP and POST methods); DNS resolution over UDP; performance optimizations (GRO/GSO); observability and troubleshooting. |
+| **04-configuration-examples** | HTTP/3 listener configurations; QUIC client cluster configurations; UDP proxy examples (DNS, gaming, VoIP); UDP tunneling configurations; performance tuning examples; TLS/mTLS configurations; complete production-ready examples; monitoring and debugging guides. |
+| **README** | Overview, documentation structure, architecture highlights with diagrams, key features, use cases. |
+
+---
+
 ### Other uncommitted .md (reference)
 
 - **envoy/network/README.md** — Network layer README.
@@ -365,5 +457,12 @@ For each **document or document series**, a short summary of what it contains.
 | **source/docs/observability/** | 6 | Observability |
 | **source/extensions/dynamic_modules/** | 7 | Dynamic modules |
 | **tools/docs/** | 9 | Development/build tools |
+| **docs/admin-operations/** | 4 | Admin interface, runtime config, operational procedures |
+| **docs/extension-development/** | 6 | Writing HTTP/network/listener filters, registration |
+| **docs/testing/** | 6 | Unit tests, integration tests, benchmarking |
+| **docs/memory-performance/** | 5 | Threading, buffers, memory management, optimization |
+| **docs/debugging/** | 5 | Error handling, logging, debugging tools, common issues |
+| **docs/deployment/** | 5 | Deployment patterns, hot restart, containers, hardening |
+| **docs/quic-udp/** | 5 | QUIC/HTTP3, UDP listeners, configuration |
 
 Use **Section 1** to find which doc covers a topic; use **Section 2** to see what each document or series contains.
