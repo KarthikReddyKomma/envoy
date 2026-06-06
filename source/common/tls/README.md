@@ -33,6 +33,7 @@ It is not the QUIC TLS implementation (that lives in `source/common/quic/`, alth
 | Cert validation | [`cert_validator/README.md`](cert_validator/README.md) | `cert_validator/` subfolder |
 | OCSP | [`ocsp/README.md`](ocsp/README.md) | `ocsp/` subfolder |
 | Private keys | [`private_key/README.md`](private_key/README.md) | `private_key/` subfolder |
+| BoringSSL surface | [`BORINGSSL_API.md`](BORINGSSL_API.md) | The BoringSSL types, functions, and callbacks Envoy actually uses |
 | Cases & scenarios | [`CASES.md`](CASES.md) | Bullet‑point answers to "what happens when X" |
 
 ---
@@ -255,7 +256,8 @@ Gauges: `days_until_first_cert_expiring` (per cert name) via `createCertificateE
 3. `context.md` — what is an `SSL_CTX` here, and why is there a vector of them?
 4. `config.md` — how does a proto become an `SSL_CTX`?
 5. `cert_validator/README.md` — what plugs in here for mTLS?
-6. `CASES.md` — verify intuition against concrete scenarios.
+6. `BORINGSSL_API.md` — what BoringSSL types / functions / callbacks are actually in use, and where?
+7. `CASES.md` — verify intuition against concrete scenarios.
 
 ### Mental model in one paragraph
 
