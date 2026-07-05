@@ -13,6 +13,200 @@ Proto: `envoy.extensions.common.matching.v3.ExtensionWithMatcher` (and `Extensio
   `DelegatingFactoryCallbacks`, `MatchDelegateConfig` (downstream + upstream), `FilterConfigPerRoute`,
   `MatchTreeValidationVisitor`.
 
+## Diagrams
+
+> A more detailed per-phase walkthrough (including a regular-filter comparison) lives in
+> [`FILTER_SEQUENCE.md`](FILTER_SEQUENCE.md).
+
+### Block diagram (components)
+
+```mermaid
+flowchart TD
+    subgraph Config["Config load (once)"]
+        Proto["ExtensionWithMatcher<br/>(extension_config + matcher/xds_matcher)"]
+        Factory["MatchDelegateConfig<br/>(Named/Upstream HttpFilterConfigFactory)"]
+        InnerFac["Wrapped filter's FilterFactoryCb"]
+        Tree["Shared match_tree"]
+        Cb["FilterFactoryCb<br/>(captures inner factory + match_tree)"]
+        Proto --> Factory
+        Factory --> InnerFac
+        Factory --> Tree
+        InnerFac --> Cb
+        Tree --> Cb
+    end
+
+    subgraph Stream["Per stream (chain construction)"]
+        DCB["DelegatingFactoryCallbacks<br/>(wraps real callbacks)"]
+        DSF["DelegatingStreamFilter"]
+        Inner["Wrapped filter instance"]
+        FMS["FilterMatchState<br/>(match_tree_ + matching_data_)"]
+        Cb --> DCB
+        DCB -->|substitutes wrapper| DSF
+        Inner --- DSF
+        DSF --> FMS
+    end
+
+    subgraph Route["Per route (optional)"]
+        PR["FilterConfigPerRoute<br/>(per-route match_tree)"]
+    end
+    PR -. overrides tree at decodeHeaders .-> FMS
+
+    subgraph Runtime["Per request/response hook"]
+        Decision{"skipFilter()?"}
+        Skip["Continue (bypass inner)"]
+        Delegate["forward to wrapped filter"]
+        FMS -->|evaluateMatch| Decision
+        Decision -->|yes| Skip
+        Decision -->|no| Delegate
+        Delegate --> Inner
+    end
+```
+
+### Class diagram
+
+```mermaid
+classDiagram
+    class StreamFilter {
+        <<interface>>
+    }
+    class FilterChainFactoryCallbacks {
+        <<interface>>
+    }
+    class RouteSpecificFilterConfig {
+        <<interface>>
+    }
+
+    class DelegatingStreamFilter {
+        -FilterMatchState match_state_
+        -StreamDecoderFilterSharedPtr decoder_filter_
+        -StreamEncoderFilterSharedPtr encoder_filter_
+        -StreamFilterBase* base_filter_
+        +decodeHeaders()
+        +decodeTrailers()
+        +encodeHeaders()
+        +setDecoderFilterCallbacks()
+        +setEncoderFilterCallbacks()
+    }
+    class FilterMatchState {
+        -MatchTreeSharedPtr match_tree_
+        -unique_ptr~HttpMatchingDataImpl~ matching_data_
+        -StreamFilterBase* base_filter_
+        -bool skip_filter_
+        -bool match_tree_evaluated_
+        +evaluateMatchTree(fn)
+        +onStreamInfo(stream_info)
+        +setMatchTree(tree)
+        +skipFilter() bool
+    }
+    class DelegatingFactoryCallbacks {
+        -FilterChainFactoryCallbacks& delegated_callbacks_
+        -MatchTreeSharedPtr match_tree_
+        +addStreamDecoderFilter(f)
+        +addStreamEncoderFilter(f)
+        +addStreamFilter(f)
+    }
+    class MatchDelegateConfig {
+        +createFilterFactoryFromProto()
+        -createFilterFactory()
+        -createRouteSpecificFilterConfigTyped()
+    }
+    class FilterConfigPerRoute {
+        -MatchTreeSharedPtr match_tree_
+        +matchTree()
+    }
+    class SkipAction
+    class SkipActionFactory
+    class MatchTreeValidationVisitor
+
+    StreamFilter <|.. DelegatingStreamFilter
+    FilterChainFactoryCallbacks <|.. DelegatingFactoryCallbacks
+    RouteSpecificFilterConfig <|.. FilterConfigPerRoute
+    NamedHttpFilterConfigFactory <|.. MatchDelegateConfig
+    UpstreamHttpFilterConfigFactory <|.. MatchDelegateConfig
+
+    DelegatingStreamFilter *-- FilterMatchState : owns
+    DelegatingStreamFilter o-- "inner" StreamFilter : decoder_/encoder_filter_
+    DelegatingFactoryCallbacks ..> DelegatingStreamFilter : creates
+    DelegatingFactoryCallbacks o-- FilterChainFactoryCallbacks : delegated_callbacks_
+    MatchDelegateConfig ..> DelegatingFactoryCallbacks : creates
+    MatchDelegateConfig ..> FilterConfigPerRoute : creates
+    MatchDelegateConfig ..> MatchTreeValidationVisitor : validates inputs
+    SkipActionFactory ..> SkipAction : creates
+    FilterMatchState ..> SkipAction : detects to skip
+    FilterConfigPerRoute ..> MatchTreeValidationVisitor : validates inputs
+```
+
+### Sequence: config load + chain construction
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Cfg as MatchDelegateConfig
+    participant FM as FilterManager (per stream)
+    participant DCB as DelegatingFactoryCallbacks
+    participant IF as Wrapped filter
+    participant DF as DelegatingStreamFilter
+    participant MS as FilterMatchState
+
+    Note over Cfg: Config load (once)
+    Cfg->>Cfg: createFilterFactory(...) builds inner factory + shared match_tree
+    Cfg-->>FM: FilterFactoryCb [inner_factory, match_tree]
+
+    Note over FM,MS: Chain construction (per stream)
+    FM->>Cfg: FilterFactoryCb(real callbacks)
+    Cfg->>DCB: DelegatingFactoryCallbacks(real callbacks, match_tree)
+    Cfg->>IF: inner_factory(delegating_callbacks)
+    IF->>DCB: addStreamFilter(InnerFilter)
+    DCB->>DF: make DelegatingStreamFilter(match_tree, Inner, Inner)
+    DCB->>FM: real callbacks.addStreamFilter(DelegatingStreamFilter)
+    Note over FM: ActiveStream*Filter ctor pushes runtime callbacks
+    FM->>DF: setDecoderFilterCallbacks(cb)
+    DF->>MS: onStreamInfo(cb.streamInfo())
+    Note right of MS: builds matching_data_ once
+    DF->>IF: setDecoderFilterCallbacks(cb) [forwarded]
+```
+
+### Sequence: request decode
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant FM as FilterManager
+    participant DF as DelegatingStreamFilter
+    participant MS as FilterMatchState
+    participant MT as match_tree (shared)
+    participant IF as Wrapped filter
+
+    FM->>DF: decodeHeaders(headers, end_stream)
+    DF->>DF: resolveMostSpecificPerFilterConfig (FilterConfigPerRoute)
+    opt per-route config present
+        DF->>MS: setMatchTree(per-route tree)
+    end
+    DF->>MS: evaluateMatchTree(onRequestHeaders)
+    alt match_tree_ == nullptr
+        MS-->>DF: skip_filter_ = true
+    else evaluate against matching_data_
+        MS->>MT: evaluateMatch(match_tree_, matching_data_)
+        alt complete & matched => SkipAction/null
+            MT-->>MS: skip_filter_ = true
+        else complete & matched => other action
+            MT-->>MS: base_filter_->onMatchCallback(action)
+        else incomplete
+            MT-->>MS: deferred (re-tried on trailers)
+        end
+    end
+    alt skipFilter()
+        DF-->>FM: Continue (inner filter NOT called)
+    else
+        DF->>IF: decodeHeaders(headers, end_stream)
+        IF-->>DF: FilterHeadersStatus
+        DF-->>FM: FilterHeadersStatus
+    end
+    Note over DF,IF: decodeData/decodeMetadata read cached skipFilter()
+    Note over DF,IF: decodeTrailers re-runs evaluateMatchTree(onRequestTrailers)
+    Note over DF,IF: Encode path mirrors with response headers/trailers
+```
+
 ## Lifecycle
 - `MatchDelegateConfig::createFilterFactoryFromProto(...)` (`config.cc:242`, `config.cc:260`) builds
   the wrapped filter's factory via `Config::Utility::getAndCheckFactory<...>` and constructs a
