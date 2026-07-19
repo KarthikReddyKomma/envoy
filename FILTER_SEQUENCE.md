@@ -155,133 +155,17 @@ sequenceDiagram
 
 ---
 
-## 3. Match-delegate filter (lazy initialization / v2)
-
-The lazy version changes **when** the inner filter is built. At chain construction it registers a
-single `DelegatingStreamFilter` as both a **stream filter** and an **access log handler**, capturing
-the inner `filter_factory` — but it does **not** invoke it. The inner filter is created only the
-first time the match tree resolves to a non-skip result, via `ensureFilterCreated()`.
-
-### 3a. Config load + chain construction (nothing inner created yet)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Cfg as MatchDelegateConfig
-    participant FM as FilterManager (per stream)
-    participant DF as DelegatingStreamFilter
-    participant MS as match_state_
-
-    rect rgb(235, 245, 255)
-    note over Cfg: Config load (once)
-    Cfg->>Cfg: createFilterFactory(...)
-    Cfg->>Cfg: build inner filter_factory
-    Cfg->>Cfg: build shared match_tree
-    Cfg-->>FM: FilterFactoryCb capturing [filter_factory, match_tree]
-    end
-
-    rect rgb(235, 255, 240)
-    note over FM,MS: Chain construction (per stream)
-    FM->>Cfg: FilterFactoryCb(real callbacks)
-    Cfg->>DF: make DelegatingStreamFilter(match_tree, filter_factory)
-    Cfg->>FM: callbacks.addStreamFilter(DF)
-    Cfg->>FM: callbacks.addAccessLogHandler(DF)
-    note over DF: inner filter NOT created here
-    note over FM: wraps DF in ActiveStream*Filter, ctor calls set*FilterCallbacks
-    FM->>DF: setDecoderFilterCallbacks(cb)
-    DF->>MS: onStreamInfo(cb.streamInfo()) -> create matching_data_
-    DF->>DF: store decoder_callbacks_ (filter_created_==false, no forward)
-    FM->>DF: setEncoderFilterCallbacks(cb)
-    DF->>DF: store encoder_callbacks_ (no forward)
-    end
-```
-
-### 3b. Request processing + lazy creation (decode path)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant FM as FilterManager
-    participant DF as DelegatingStreamFilter
-    participant MS as match_state_
-    participant MT as match_tree (shared)
-    participant CC as FilterCreationCallbacks
-    participant IF as Inner filter
-
-    FM->>DF: decodeHeaders(headers, end_stream)
-    DF->>DF: resolve per-route config (setMatchTree if present)
-    DF->>MS: evaluateMatchTree(onRequestHeaders)
-    alt match_tree_ == nullptr
-        MS-->>DF: skip_filter_ = true
-    else evaluate
-        MS->>MT: evaluateMatch(match_tree_, matching_data_)
-        alt SkipAction / null
-            MT-->>MS: skip_filter_ = true
-        else custom action
-            MT-->>MS: pending_match_action_ = action (deferred)
-        else incomplete
-            MT-->>MS: defer (retry on later hooks)
-        end
-    end
-
-    DF->>DF: maybeCreateAndDispatch()
-    alt skipFilter() == true
-        note over DF,IF: return early - inner filter NEVER created
-    else not skipped
-        DF->>DF: ensureFilterCreated()
-        DF->>CC: FilterCreationCallbacks(*this)
-        DF->>IF: filter_factory_(creation_callbacks)
-        IF->>CC: addStreamFilter(Inner) / addAccessLogHandler(logger)
-        CC->>DF: push into decoder_/encoder_/base_filters_, access_loggers_
-        DF->>IF: replay stored set{Decoder,Encoder}FilterCallbacks
-        opt pending_match_action_ present
-            DF->>IF: base_filter->onMatchCallback(action)
-        end
-    end
-
-    alt skipFilter() == true
-        DF-->>FM: Continue (inner filter not called)
-    else
-        DF->>IF: decodeHeaders(...) over decoder_filters_ (in order)
-        IF-->>DF: FilterHeadersStatus
-        DF-->>FM: first non-Continue status
-    end
-
-    note over DF,IF: encode path mirrors this, encoder_filters_ iterated in reverse
-```
-
-### 3c. Access-log gating (stream end)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant FM as FilterManager
-    participant DF as DelegatingStreamFilter
-    participant L as access_loggers_
-
-    FM->>DF: log(context, stream_info)
-    alt inner filter was created (non-skip)
-        DF->>L: log(context, info) for each logger
-    else skipped
-        note over DF,L: access_loggers_ is empty -> no logs emitted
-    end
-```
-
----
-
 ## Side-by-side
 
-| Aspect | Regular filter | Match-delegate (eager / v1) | Match-delegate (lazy / v2) |
-| --- | --- | --- | --- |
-| Built once at config load | `FilterFactoryCb` | `FilterFactoryCb` + shared `match_tree` + inner `filter_factory` | same as v1 |
-| Factory callbacks | real, used directly | wrapped in `DelegatingFactoryCallbacks` to intercept registration | inner `filter_factory` captured; run later via `FilterCreationCallbacks` |
-| Object added to chain | the filter itself | `DelegatingStreamFilter` wrapping the inner filter | `DelegatingStreamFilter` as stream filter **and** access log handler |
-| Inner filter created | at chain construction | at chain construction (eager) | first non-skip match, in `ensureFilterCreated()` (lazy) |
-| `set*FilterCallbacks` | consumed by the filter | forwarded to inner immediately | stored; replayed to inner when it is created |
-| Per-stream allocations | one filter | one inner filter + one `DelegatingStreamFilter` | one `DelegatingStreamFilter`; inner only if not skipped |
-| `onMatchCallback` (custom action) | n/a | dispatched inline from `evaluateMatchTree` | deferred (`pending_match_action_`), dispatched after creation |
-| Access loggers | filter's own | registered unconditionally (run even when skipped) | run only if inner filter was created (skipped ⇒ none) |
-| Per-request extra logic | none | evaluate `match_tree` → skip or delegate each hook | same, plus lazy `maybeCreateAndDispatch()` |
+| Aspect | Regular filter | Match-delegate |
+| --- | --- | --- |
+| Built once at config load | `FilterFactoryCb` | `FilterFactoryCb` + shared `match_tree` + inner `filter_factory` |
+| Factory callbacks | real, used directly | wrapped in `DelegatingFactoryCallbacks` to intercept registration |
+| Object added to chain | the filter itself | `DelegatingStreamFilter` wrapping the inner filter |
+| `set*FilterCallbacks` | consumed by the filter | consumed by delegate: creates `matching_data_` (`onStreamInfo`), then forwarded to inner |
+| Per-stream allocations | one filter | one inner filter + one `DelegatingStreamFilter` |
+| Per-request extra logic | none | evaluate `match_tree` → skip or delegate each hook |
+| Match evaluation | n/a | evaluated + cached (`match_tree_evaluated_`); re-tried on trailers if incomplete |
 
 ## Code references
 
@@ -293,13 +177,3 @@ sequenceDiagram
 - `evaluateMatchTree` (feed data, evaluate, cache, skip/`onMatchCallback`): `comparison/v1_config.cc:56-84`.
 - Runtime callbacks pushed during chain build: `source/common/http/filter_manager.h:252`, `:342`,
   `addStream*Filter` at `:999-1019`.
-
-### Lazy (v2) references
-
-- Per-stream wrapper registered as stream filter + access log handler: `comparison/v2_config.cc:470-474`.
-- `ensureFilterCreated()` (runs inner factory, replays stored callbacks): `comparison/v2_config.cc:111-139`.
-- `maybeCreateAndDispatch()` (create + dispatch deferred action): `comparison/v2_config.cc:141-153`.
-- `FilterCreationCallbacks` (collects inner filters + loggers): `comparison/v2_config.cc:89-109`, decl `comparison/v2_config.h:96-113`.
-- Deferred custom action (`pending_match_action_` / `takePendingMatchAction`): `comparison/v2_config.cc:81-83`, `comparison/v2_config.h:47-56`.
-- Access-log gating (`log()` fans out only if created): `comparison/v2_config.cc:189-195`.
-- Callback storage + replay on late creation: `comparison/v2_config.cc:292-302`, `:409-419`.
