@@ -64,6 +64,18 @@ envoy_cc_test(
 )
 
 envoy_cc_test(
+    name = "cpu_affinity_test",
+    srcs = ["cpu_affinity_test.cc"],
+    rbe_pool = "6gig",
+    deps = [
+        "//source/common/api:os_sys_calls_lib",
+        "//source/common/common:cpu_affinity_lib",
+        "//test/mocks/api:api_mocks",
+        "//test/test_common:threadsafe_singleton_injector_lib",
+    ],
+)
+
+envoy_cc_test(
     # Same as assert_test above, but with ENVOY_LOG_DEBUG_ASSERT_IN_RELEASE
     name = "assert_enabled_in_release_test",
     srcs = ["assert_test.cc"],
@@ -139,6 +151,13 @@ envoy_cc_fuzz_test(
     corpus = "hash_corpus",
     rbe_pool = "6gig",
     deps = ["//source/common/common:hash_lib"],
+)
+
+envoy_cc_test(
+    name = "callbacks_handler_test",
+    srcs = ["callbacks_handler_test.cc"],
+    rbe_pool = "6gig",
+    deps = ["//source/common/common:callbacks_handler_lib"],
 )
 
 envoy_cc_test(

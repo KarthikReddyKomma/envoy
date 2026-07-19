@@ -5,12 +5,15 @@
 #include "test/mocks/server/factory_context.h"
 #include "test/mocks/upstream/cluster_info.h"
 #include "test/mocks/upstream/priority_set.h"
+#include "test/test_common/status_utility.h"
 
 namespace Envoy {
 namespace Extensions {
 namespace LoadBalancingPolicies {
 namespace LoadAwareLocality {
 namespace {
+
+using ::Envoy::StatusHelpers::HasStatusCode;
 
 TEST(LoadAwareLocalityConfigTest, CreateFactory) {
   NiceMock<Server::Configuration::MockServerFactoryContext> context;
@@ -20,15 +23,14 @@ TEST(LoadAwareLocalityConfigTest, CreateFactory) {
   envoy::config::core::v3::TypedExtensionConfig config;
   config.set_name("envoy.load_balancing_policies.load_aware_locality");
   LoadAwareLocalityProto config_msg;
-  config.mutable_typed_config()->PackFrom(config_msg);
+  std::ignore = config.mutable_typed_config()->PackFrom(config_msg);
 
   auto& factory = Config::Utility::getAndCheckFactory<Upstream::TypedLoadBalancerFactory>(config);
   EXPECT_EQ("envoy.load_balancing_policies.load_aware_locality", factory.name());
 
   // loadConfig returns UnimplementedError until the policy is functional.
   auto lb_config = factory.loadConfig(context, *factory.createEmptyConfigProto());
-  EXPECT_FALSE(lb_config.ok());
-  EXPECT_EQ(lb_config.status().code(), absl::StatusCode::kUnimplemented);
+  EXPECT_THAT(lb_config, HasStatusCode(absl::StatusCode::kUnimplemented));
 
   // create is stubbed to return nullptr for now.
   auto thread_aware_lb =

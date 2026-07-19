@@ -19,6 +19,7 @@
 #include "test/mocks/tracing/mocks.h"
 #include "test/mocks/upstream/cluster_manager.h"
 #include "test/mocks/upstream/host.h"
+#include "test/test_common/status_utility.h"
 
 #include "gmock/gmock.h"
 
@@ -66,12 +67,12 @@ class DynamicModuleListenerFilterAbiCallbackTest : public testing::Test {
 public:
   void SetUp() override {
     auto dynamic_module = newDynamicModule(testSharedObjectPath("listener_no_op", "c"), false);
-    EXPECT_TRUE(dynamic_module.ok()) << dynamic_module.status().message();
+    EXPECT_OK(dynamic_module);
 
     auto filter_config_or_status = newDynamicModuleListenerFilterConfig(
         "test_filter", "", DefaultMetricsNamespace, std::move(dynamic_module.value()),
         cluster_manager_, *stats_.rootScope(), main_thread_dispatcher_);
-    EXPECT_TRUE(filter_config_or_status.ok()) << filter_config_or_status.status().message();
+    EXPECT_OK(filter_config_or_status);
     filter_config_ = filter_config_or_status.value();
     // Re-open stat creation so tests can call `define_*` from the test thread.
     filter_config_->stat_creation_frozen_ = false;
@@ -1456,6 +1457,56 @@ TEST_F(DynamicModuleListenerFilterAbiCallbackTest, SetDynamicMetadataNullValue) 
                                                                             key_buf, value_buf);
 }
 
+TEST_F(DynamicModuleListenerFilterAbiCallbackTest, SetDynamicMetadataStringBatch) {
+  envoy::config::core::v3::Metadata metadata;
+  EXPECT_CALL(callbacks_, dynamicMetadata()).WillRepeatedly(testing::ReturnRef(metadata));
+  EXPECT_CALL(callbacks_, setDynamicMetadata(std::string("test_ns"), testing::_))
+      .WillRepeatedly(testing::SaveArg<1>(&(*metadata.mutable_filter_metadata())["test_ns"]));
+
+  char ns[] = "test_ns";
+  envoy_dynamic_module_type_module_buffer ns_buf = {ns, 7};
+
+  // A batch sets every entry, and within the batch a later duplicate key wins.
+  std::vector<envoy_dynamic_module_type_module_key_value_pair> entries = {
+      {"k1", 2, "v1", 2},
+      {"k2", 2, "v2", 2},
+      {"k1", 2, "v1b", 3},
+  };
+  envoy_dynamic_module_callback_listener_filter_set_dynamic_metadata_string_batch(
+      filterPtr(), ns_buf, entries.data(), entries.size());
+
+  envoy_dynamic_module_type_envoy_buffer result;
+  EXPECT_TRUE(envoy_dynamic_module_callback_listener_filter_get_dynamic_metadata_string(
+      filterPtr(), ns_buf, {"k1", 2}, &result));
+  EXPECT_EQ("v1b", std::string(result.ptr, result.length));
+  EXPECT_TRUE(envoy_dynamic_module_callback_listener_filter_get_dynamic_metadata_string(
+      filterPtr(), ns_buf, {"k2", 2}, &result));
+  EXPECT_EQ("v2", std::string(result.ptr, result.length));
+}
+
+TEST_F(DynamicModuleListenerFilterAbiCallbackTest, SetDynamicMetadataStringBatchEmpty) {
+  // An empty batch is a no-op and must not set any metadata.
+  EXPECT_CALL(callbacks_, setDynamicMetadata(testing::_, testing::_)).Times(0);
+
+  char ns[] = "test_ns";
+  envoy_dynamic_module_type_module_buffer ns_buf = {ns, 7};
+  envoy_dynamic_module_callback_listener_filter_set_dynamic_metadata_string_batch(
+      filterPtr(), ns_buf, nullptr, 0);
+}
+
+TEST_F(DynamicModuleListenerFilterAbiCallbackTest, SetDynamicMetadataStringBatchNullCallbacks) {
+  auto filter = std::make_shared<DynamicModuleListenerFilter>(filter_config_);
+  filter->onAccept(callbacks_);
+  filter->setCallbacksForTest(nullptr);
+
+  char ns[] = "test_ns";
+  envoy_dynamic_module_type_module_buffer ns_buf = {ns, 7};
+  std::vector<envoy_dynamic_module_type_module_key_value_pair> entries = {{"k1", 2, "v1", 2}};
+  // Should not crash with null callbacks.
+  envoy_dynamic_module_callback_listener_filter_set_dynamic_metadata_string_batch(
+      static_cast<void*>(filter.get()), ns_buf, entries.data(), entries.size());
+}
+
 // =============================================================================
 // Tests for set_filter_state.
 // =============================================================================
@@ -2388,12 +2439,12 @@ class DynamicModuleListenerFilterHttpCalloutTest : public testing::Test {
 public:
   void SetUp() override {
     auto dynamic_module = newDynamicModule(testSharedObjectPath("listener_no_op", "c"), false);
-    EXPECT_TRUE(dynamic_module.ok()) << dynamic_module.status().message();
+    EXPECT_OK(dynamic_module);
 
     auto filter_config_or_status = newDynamicModuleListenerFilterConfig(
         "test_filter", "", DefaultMetricsNamespace, std::move(dynamic_module.value()),
         cluster_manager_, *stats_.rootScope(), main_thread_dispatcher_);
-    EXPECT_TRUE(filter_config_or_status.ok()) << filter_config_or_status.status().message();
+    EXPECT_OK(filter_config_or_status);
     filter_config_ = filter_config_or_status.value();
     // Re-open stat creation so tests can call `define_*` from the test thread.
     filter_config_->stat_creation_frozen_ = false;
@@ -2892,6 +2943,65 @@ TEST_F(DynamicModuleListenerFilterAbiCallbackTest, ConfigStatsOperate) {
   EXPECT_EQ(envoy_dynamic_module_type_metrics_result_MetricNotFound,
             envoy_dynamic_module_callback_listener_filter_config_record_histogram_value(
                 config, invalid_id, 1));
+}
+
+TEST_F(DynamicModuleListenerFilterAbiCallbackTest, GetAttributeInt) {
+  const uint64_t response_flags = (1ULL << 1) | (1ULL << 26);
+  EXPECT_CALL(callbacks_.stream_info_, legacyResponseFlags())
+      .WillRepeatedly(testing::Return(response_flags));
+  uint64_t result = 0;
+  EXPECT_TRUE(envoy_dynamic_module_callback_listener_filter_get_attribute_int(
+      filterPtr(), envoy_dynamic_module_type_attribute_id_ResponseFlags, &result));
+  EXPECT_EQ(response_flags, result);
+
+  // A request attribute that is not backed by stream info returns false.
+  EXPECT_FALSE(envoy_dynamic_module_callback_listener_filter_get_attribute_int(
+      filterPtr(), envoy_dynamic_module_type_attribute_id_RequestPath, &result));
+}
+
+TEST_F(DynamicModuleListenerFilterAbiCallbackTest, GetAttributeBool) {
+  EXPECT_CALL(callbacks_.stream_info_, healthCheck()).WillRepeatedly(testing::Return(true));
+  bool result = false;
+  EXPECT_TRUE(envoy_dynamic_module_callback_listener_filter_get_attribute_bool(
+      filterPtr(), envoy_dynamic_module_type_attribute_id_HealthCheck, &result));
+  EXPECT_TRUE(result);
+
+  // An unsupported bool attribute returns false.
+  EXPECT_FALSE(envoy_dynamic_module_callback_listener_filter_get_attribute_bool(
+      filterPtr(), envoy_dynamic_module_type_attribute_id_RequestPath, &result));
+}
+
+TEST_F(DynamicModuleListenerFilterAbiCallbackTest, GetAttributeString) {
+  const std::optional<std::string> details = "via_upstream";
+  EXPECT_CALL(callbacks_.stream_info_, responseCodeDetails())
+      .WillRepeatedly(testing::ReturnRef(details));
+  envoy_dynamic_module_type_envoy_buffer result = {nullptr, 0};
+  EXPECT_TRUE(envoy_dynamic_module_callback_listener_filter_get_attribute_string(
+      filterPtr(), envoy_dynamic_module_type_attribute_id_ResponseCodeDetails, &result));
+  EXPECT_EQ("via_upstream", std::string(result.ptr, result.length));
+
+  // An int attribute requested as string returns false.
+  EXPECT_FALSE(envoy_dynamic_module_callback_listener_filter_get_attribute_string(
+      filterPtr(), envoy_dynamic_module_type_attribute_id_ResponseFlags, &result));
+}
+
+TEST_F(DynamicModuleListenerFilterAbiCallbackTest, GetAttributeNullCallbacks) {
+  auto filter = std::make_shared<DynamicModuleListenerFilter>(filter_config_);
+  filter->onAccept(callbacks_);
+  filter->setCallbacksForTest(nullptr);
+
+  envoy_dynamic_module_type_envoy_buffer str_result = {nullptr, 0};
+  EXPECT_FALSE(envoy_dynamic_module_callback_listener_filter_get_attribute_string(
+      static_cast<void*>(filter.get()), envoy_dynamic_module_type_attribute_id_ResponseCodeDetails,
+      &str_result));
+  uint64_t int_result = 0;
+  EXPECT_FALSE(envoy_dynamic_module_callback_listener_filter_get_attribute_int(
+      static_cast<void*>(filter.get()), envoy_dynamic_module_type_attribute_id_ResponseFlags,
+      &int_result));
+  bool bool_result = false;
+  EXPECT_FALSE(envoy_dynamic_module_callback_listener_filter_get_attribute_bool(
+      static_cast<void*>(filter.get()), envoy_dynamic_module_type_attribute_id_HealthCheck,
+      &bool_result));
 }
 
 } // namespace ListenerFilters

@@ -16,7 +16,9 @@
 #include "source/common/network/utility.h"
 #include "source/common/quic/active_quic_listener.h"
 #include "source/common/quic/envoy_quic_clock.h"
+#include "source/common/quic/envoy_quic_packet_writer.h"
 #include "source/common/quic/envoy_quic_utils.h"
+#include "source/common/quic/quic_packet_writer_interface.h"
 #include "source/common/quic/udp_gso_batch_writer.h"
 #include "source/common/runtime/runtime_impl.h"
 #include "source/extensions/quic/crypto_stream/envoy_quic_crypto_server_stream.h"
@@ -24,6 +26,7 @@
 #include "source/server/configuration_impl.h"
 #include "source/server/process_context_impl.h"
 
+#include "test/common/quic/fake_quic_packet_writer.h"
 #include "test/common/quic/test_proof_source.h"
 #include "test/common/quic/test_utils.h"
 #include "test/mocks/network/mocks.h"
@@ -133,7 +136,7 @@ protected:
       : version_(GetParam()), api_(Api::createApiForTest(simulated_time_system_)),
         dispatcher_(api_->allocateDispatcher("test_thread")), clock_(*dispatcher_),
         local_address_(Network::Test::getAnyAddress(version_, true)),
-        connection_handler_(*dispatcher_, absl::nullopt),
+        connection_handler_(*dispatcher_, std::nullopt),
         transport_socket_factory_(*Quic::QuicServerTransportSocketFactory::create(
             /*enable_early_data=*/true, /*enable_resumption=*/true, *store_.rootScope(),
             std::make_unique<NiceMock<Ssl::MockServerContextConfig>>(), ssl_context_manager_)),
@@ -627,7 +630,7 @@ TEST_P(ActiveQuicListenerTest, QuicRejectsAllAndResumes) {
 TEST_P(ActiveQuicListenerTest, EcnReportingIsEnabled) {
   initialize();
   Network::Socket& socket = ActiveQuicListenerPeer::socket(*quic_listener_);
-  absl::optional<Network::Address::IpVersion> version = socket.ipVersion();
+  std::optional<Network::Address::IpVersion> version = socket.ipVersion();
   EXPECT_TRUE(version.has_value());
   int optval = 0;
   socklen_t optlen = sizeof(optval);
@@ -765,12 +768,55 @@ TEST_F(ActiveQuicListenerFactoryTest, DebugVisitorConfigured) {
   envoy::config::listener::v3::QuicProtocolOptions quic_config;
   quic_config.mutable_connection_debug_visitor_config()->set_name(
       "envoy.quic.connection_debug_visitor.mock");
-  quic_config.mutable_connection_debug_visitor_config()->mutable_typed_config()->PackFrom(
-      test::common::config::DummyConfig());
+  std::ignore =
+      quic_config.mutable_connection_debug_visitor_config()->mutable_typed_config()->PackFrom(
+          test::common::config::DummyConfig());
   auto listener_factory = createQuicListenerFactory(quic_config);
   auto debug_visitor_factory =
       ActiveQuicListenerFactoryPeer::debugVisitorFactory(listener_factory.get());
   EXPECT_TRUE(debug_visitor_factory.has_value());
+}
+
+namespace {
+
+class MockQuicPacketWriterFactory : public QuicPacketWriterFactory {
+public:
+  MockQuicPacketWriterFactory() = default;
+  ~MockQuicPacketWriterFactory() override = default;
+
+  MOCK_METHOD(QuicPacketWriterPtr, createQuicPacketWriter,
+              (Network::IoHandle & io_handle, Stats::Scope& scope,
+               Envoy::Event::Dispatcher& dispatcher, absl::AnyInvocable<void() &&> on_can_write_cb),
+              (override));
+};
+
+} // namespace
+
+TEST_P(ActiveQuicListenerTest, DirectQuicPacketWriterCreation) {
+  MockQuicPacketWriterFactory quic_packet_writer_factory;
+
+  // Override the quicPacketWriterFactory mock to return our QUIC factory.
+  EXPECT_CALL(udp_listener_config_, quicPacketWriterFactory())
+      .WillRepeatedly(Return(&quic_packet_writer_factory));
+
+  // Expect createQuicPacketWriter to be called, and return our dummy writer.
+  FakeQuicPacketWriter* raw_writer = nullptr;
+  EXPECT_CALL(quic_packet_writer_factory, createQuicPacketWriter(_, _, _, _))
+      .WillOnce(Invoke([&raw_writer](Network::IoHandle&, Stats::Scope&, Envoy::Event::Dispatcher&,
+                                     absl::AnyInvocable<void()&&>) -> QuicPacketWriterPtr {
+        auto writer = std::make_unique<FakeQuicPacketWriter>();
+        raw_writer = writer.get();
+        return writer;
+      }));
+
+  // Initialize the listener. This will trigger createQuicPacketWriter.
+  initialize();
+
+  // Verify that the dispatcher was initialized with a writer (it shouldn't be null).
+  EXPECT_NE(quic_dispatcher_, nullptr);
+
+  // Verify that the listener keeps a member pointing to the created writer.
+  EXPECT_EQ(quic_listener_->quicPacketWriter(), raw_writer);
 }
 
 } // namespace Quic
