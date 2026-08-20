@@ -100,12 +100,12 @@ Thrift and generic-proxy follow the exact same recipe with their own protos.
 
 ```mermaid
 flowchart LR
-    Parent[Parent Init::Manager<br/>(listener / HCM scope)]
-    PT[parent_init_target_<br/>SharedTargetImpl]
-    LIM[local_init_manager_<br/>ManagerImpl]
-    LIT[local_init_target_<br/>TargetImpl]
-    Watch[local_init_watcher_<br/>WatcherImpl]
-    Sub[(xDS subscription_)]
+    Parent["Parent Init::Manager<br/>(listener / HCM scope)"]
+    PT["parent_init_target_<br/>SharedTargetImpl"]
+    LIM["local_init_manager_<br/>ManagerImpl"]
+    LIT["local_init_target_<br/>TargetImpl"]
+    Watch["local_init_watcher_<br/>WatcherImpl"]
+    Sub[("xDS subscription_")]
 
     Parent --> PT
     PT -->|"ready: initialize(local_init_watcher_)"| LIM

@@ -879,12 +879,12 @@ graph TB
 
 ```mermaid
 graph TD
-    Start[Incoming Request] --> ExtractHost[Extract :authority header]
+    Start[Incoming Request] --> ExtractHost["Extract :authority header"]
     ExtractHost --> MatchHost{Match Virtual Host}
 
     MatchHost -->|Exact| ExactHost[Exact Host Match]
-    MatchHost -->|Wildcard Suffix| SuffixHost[*.example.com]
-    MatchHost -->|Wildcard Prefix| PrefixHost[example.*]
+    MatchHost -->|Wildcard Suffix| SuffixHost["*.example.com"]
+    MatchHost -->|Wildcard Prefix| PrefixHost["example.*"]
     MatchHost -->|Default| DefaultHost[Default VHost]
 
     ExactHost --> MatchRoute[Match Route]
@@ -894,11 +894,11 @@ graph TD
 
     MatchRoute --> CheckPath{Path Match Type}
 
-    CheckPath -->|Exact| ExactPath[Exact: /api/users]
-    CheckPath -->|Prefix| PrefixPath[Prefix: /api/]
-    CheckPath -->|Regex| RegexPath[Regex: /api/.*/users]
-    CheckPath -->|Template| TemplatePath[Template: /api/{id}/users]
-    CheckPath -->|PathSeparated| PSPath[PathSep: /api/]
+    CheckPath -->|Exact| ExactPath["Exact: /api/users"]
+    CheckPath -->|Prefix| PrefixPath["Prefix: /api/"]
+    CheckPath -->|Regex| RegexPath["Regex: /api/.*/users"]
+    CheckPath -->|Template| TemplatePath["Template: /api/:id/users"]
+    CheckPath -->|PathSeparated| PSPath["PathSep: /api/"]
 
     ExactPath --> CheckHeaders{Check Headers}
     PrefixPath --> CheckHeaders
